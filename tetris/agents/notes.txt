@@ -1,0 +1,273 @@
+Combined Implementation:
+package src.pas.tetris.agents;
+
+import java.util.*;
+
+import edu.bu.tetris.agents.QAgent;
+import edu.bu.tetris.agents.TrainerAgent.GameCounter;
+import edu.bu.tetris.game.Board;
+import edu.bu.tetris.game.Game.GameView;
+import edu.bu.tetris.game.minos.Mino;
+import edu.bu.tetris.linalg.Matrix;
+import edu.bu.tetris.nn.Model;
+import edu.bu.tetris.nn.models.Sequential;
+import edu.bu.tetris.nn.layers.Dense;
+import edu.bu.tetris.nn.layers.ReLU;
+
+public class EnhancedTetrisQAgent extends QAgent {
+    private static final double INITIAL_EXPLORATION_PROB = 0.8;
+    private static final double FINAL_EXPLORATION_PROB = 0.01;
+    private static final double EXPLORATION_DECAY_RATE = 0.00005;
+
+    private final Random random;
+    private long totalSteps;
+    private Map<String, Integer> stateVisitCounts;
+
+    public EnhancedTetrisQAgent(String name) {
+        super(name);
+        this.random = new Random();
+        this.totalSteps = 0;
+        this.stateVisitCounts = new HashMap<>();
+    }
+
+    @Override
+    public Model initQFunction() {
+        int inputFeatures = Board.NUM_ROWS * Board.NUM_COLS + 10; // Flattened board + extra features
+        int hiddenLayerSize = inputFeatures / 2;
+        int outputSize = 1;
+
+        Sequential model = new Sequential();
+        model.add(new Dense(inputFeatures, hiddenLayerSize));
+        model.add(new ReLU());
+        model.add(new Dense(hiddenLayerSize, hiddenLayerSize / 2));
+        model.add(new ReLU());
+        model.add(new Dense(hiddenLayerSize / 2, outputSize));
+
+        return model;
+    }
+
+    @Override
+    public Matrix getQFunctionInput(GameView game, Mino potentialAction) {
+        Matrix boardState = game.getGrayscaleImage(potentialAction).flatten();
+        return augmentFeatures(boardState, potentialAction);
+    }
+
+    private Matrix augmentFeatures(Matrix boardState, Mino action) {
+        int extraFeatures = 10;
+        Matrix inputVector = Matrix.full(1, boardState.numel() + extraFeatures, 0);
+
+        // Copy board state into the input vector
+        for (int i = 0; i < boardState.numel(); i++) {
+            inputVector.set(0, i, boardState.get(0, i));
+        }
+
+        int offset = boardState.numel();
+
+        // Add features based on the mino type and orientation
+        for (Mino.MinoType type : Mino.MinoType.values()) {
+            inputVector.set(0, offset++, type == action.getType() ? 1 : 0);
+        }
+        for (int orientation = 0; orientation < 4; orientation++) {
+            inputVector.set(0, offset++, orientation == action.getOrientation().ordinal() ? 1 : 0);
+        }
+
+        // Add pivot position
+        inputVector.set(0, offset++, action.getPivotBlockCoordinate().getXCoordinate());
+        inputVector.set(0, offset, action.getPivotBlockCoordinate().getYCoordinate());
+
+        return inputVector;
+    }
+
+    @Override
+    public boolean shouldExplore(GameView game, GameCounter gameCounter) {
+        totalSteps++;
+        double explorationProbability = Math.max(INITIAL_EXPLORATION_PROB * Math.exp(-EXPLORATION_DECAY_RATE * totalSteps), FINAL_EXPLORATION_PROB);
+        return random.nextDouble() < explorationProbability;
+    }
+
+    @Override
+    public Mino getExplorationMove(GameView game) {
+        List<Mino> possibleMoves = game.getFinalMinoPositions();
+        if (possibleMoves.isEmpty()) return null;
+
+        // Select an action with minimal visits
+        return possibleMoves.stream()
+                .min(Comparator.comparingInt(move -> getVisitCount(gameToStateKey(game, move))))
+                .orElse(possibleMoves.get(random.nextInt(possibleMoves.size())));
+    }
+
+    private String gameToStateKey(GameView game, Mino action) {
+        return game.getGrayscaleImage(action).flatten().toString() + "_" + action.getType() + "_" + action.getOrientation();
+    }
+
+    private int getVisitCount(String stateKey) {
+        return stateVisitCounts.getOrDefault(stateKey, 0);
+    }
+
+    private void incrementVisitCount(String stateKey) {
+        stateVisitCounts.put(stateKey, stateVisitCounts.getOrDefault(stateKey, 0) + 1);
+    }
+
+    @Override
+    public double getReward(GameView game) {
+        Board board = game.getBoard();
+
+        // Calculate features for reward function
+        int stackHeight = calculateStackHeight(board);
+        int holes = calculateHoles(board);
+        int clearedLines = board.getFullLines().size();
+
+        // Reward/penalty terms
+        double reward = clearedLines * 100;
+        reward -= stackHeight * 10;
+        reward -= holes * 5;
+
+        if (game.didAgentLose()) {
+            reward -= 1000; // Heavy penalty for losing
+        }
+
+        return reward;
+    }
+
+    private int calculateStackHeight(Board board) {
+        for (int row = 0; row < Board.NUM_ROWS; row++) {
+            for (int col = 0; col < Board.NUM_COLS; col++) {
+                if (board.isCoordinateOccupied(col, row)) {
+                    return Board.NUM_ROWS - row;
+                }
+            }
+        }
+        return 0;
+    }
+
+    private int calculateHoles(Board board) {
+        int holes = 0;
+        for (int col = 0; col < Board.NUM_COLS; col++) {
+            boolean foundBlock = false;
+            for (int row = 0; row < Board.NUM_ROWS; row++) {
+                if (board.isCoordinateOccupied(col, row)) {
+                    foundBlock = true;
+                } else if (foundBlock) {
+                    holes++;
+                }
+            }
+        }
+        return holes;
+    }
+
+    @Override
+    public void trainQFunction(Dataset dataset, LossFunction lossFunction, Optimizer optimizer, long numUpdates) {
+        for (int epoch = 0; epoch < numUpdates; epoch++) {
+            dataset.shuffle();
+            for (Pair<Matrix, Matrix> batch : dataset) {
+                Matrix predicted = this.getQFunction().forward(batch.getFirst());
+                optimizer.reset();
+                this.getQFunction().backwards(batch.getFirst(), lossFunction.backwards(predicted, batch.getSecond()));
+                optimizer.step();
+            }
+        }
+    }
+}
+
+
+
+usage: Main [-h] [-a AGENT] [-q QFUNCTION] [-p NUMCYCLES] [-t NUMTRAININGGAMES] [-v NUMEVALGAMES]
+            [-b MAXBUFFERSIZE] [-r {RANDOM,OLDEST}] [-u NUMUPDATES] [-m MINIBATCHSIZE] [-n LR] [-c CLIP]
+            [-d OPTIMIZERTYPE] [-b1 BETA1] [-b2 BETA2] [-g GAMMA] [-i INFILE] [-o OUTFILE]
+            [--outOffset OUTOFFSET] [-s] [--seed SEED] [-l MAXMINOLENGTH]
+
+Play a game of Tetris
+
+named arguments:
+  -h, --help             show this help message and exit
+  -a AGENT, --agent AGENT
+                         Specify fully-qualified class for the  agent  to  play tetris (default: edu.bu.
+                         tetris.agents.TrainerAgent)
+  -q QFUNCTION, --qFunction QFUNCTION
+                         The q-function agent to train if the -a (--agent) argument has been set to edu.
+                         bu.tetris.agents.TrainerAgent and ignored  otherwise. (default: src.pas.tetris.
+                         agents.TetrisQAgent)
+  -p NUMCYCLES, --numCycles NUMCYCLES
+                         the number of times the training/testing cycle is repeated (default: 1)
+  -t NUMTRAININGGAMES, --numTrainingGames NUMTRAININGGAMES
+                         the  number  of  training  games  to  collect  training  data  from  before  an
+                         evaluation phase (default: 10)
+  -v NUMEVALGAMES, --numEvalGames NUMEVALGAMES
+                         the number of evaluation games to play  while fixing the agent (the agent can't
+                         learn from these games) (default: 5)
+  -b MAXBUFFERSIZE, --maxBufferSize MAXBUFFERSIZE
+                         The max  number  of  samples  to  store  in  the  replay  buffer  if  using the
+                         TrainerAgent. (default: 1280)
+  -r {RANDOM,OLDEST}, --replacementType {RANDOM,OLDEST}
+                         replay buffer replacement type for when a new  sample is added to a full buffer
+                         (default: RANDOM)
+  -u NUMUPDATES, --numUpdates NUMUPDATES
+                         the number of epochs  to  train  for  after  each  training  phase if using the
+                         TrainerAgent. (default: 1)
+  -m MINIBATCHSIZE, --miniBatchSize MINIBATCHSIZE
+                         batch  size  to  use  when  performing  an  epoch  of  training  if  using  the
+                         TrainerAgent. (default: 128)
+  -n LR, --lr LR         the learning rate to use if using the TrainerAgent. (default: 1.0E-6)
+  -c CLIP, --clip CLIP   gradient clip value to  use  (symmetric)  if  using the TrainerAgent. (default:
+                         100.0)
+  -d OPTIMIZERTYPE, --optimizerType OPTIMIZERTYPE
+                         type of optimizer to use if using the TrainerAgent (default: sgd)
+  -b1 BETA1, --beta1 BETA1
+                         beta1 value for adam optimizer (default: 0.9)
+  -b2 BETA2, --beta2 BETA2
+                         beta2 value for adam optimizer (default: 0.999)
+  -g GAMMA, --gamma GAMMA
+                         discount factor for the Bellman  equation  if using the TrainerAgent. (default:
+                         1.0E-4)
+  -i INFILE, --inFile INFILE
+                         params file to load (default: )
+  -o OUTFILE, --outFile OUTFILE
+                         where to save the model to  (will  append  XX.model  where  XX is the number of
+                         training/eval  cycles  performed  if   using   the  TrainerAgent.  (default:  .
+                         /params/qFunction)
+  --outOffset OUTOFFSET  offset to XX value appended to  end  of  --outFile  arg.  Useful if you want to
+                         resume training from a previous training point  and don't want to overwrite any
+                         subsequent files. (XX + offset) will be  used instead of (XX) when appending to
+                         the --outFile arg. Only used if using the TrainerAgent. (default: 1)
+  -s, --silent           if specified, run the game without the GUI. (default: false)
+  --seed SEED            random seed to  make  successive  runs  repeatable.  If  -1l,  no  seed is used
+                         (default: -1)
+  -l MAXMINOLENGTH, --maxMinoLength MAXMINOLENGTH
+                         the maximum  number  of  minos  allowed  to  be  played  during  a  single game
+                         (default: 10000)
+
+
+
+
+
+Code to run in terminal:
+My terminal: java -cp "./lib/*:." edu.bu.tetris.Main -p 2500 -t 5 -v 5 -g 0.99 -n 1e-4 --numUpdates 3 -b 50000 | tee my_logfile.log
+His terminal: java -cp "./lib/*:." edu.bu.tetris.Main -p 5000 -t 10000 -v 5000 -g 0.99 -n 1e-6 --numUpdates 3 -b 50000 -s | tee my_logfile.log
+
+-n 0.0001
+
+Start screen: screen -h 10000 -S tetris_train
+Look at Screen: screen -r tetris_train
+Put in files: rsync -avz ./src/ ktan03@10.210.1.217:/home/ktan03/src/
+Get files: scp ktan03@10.210.1.217:/home/ktan03/my_logfile.log ./newLogFiles/
+scp ktan03@10.210.1.217:/home/ktan03/tetris_test2/my_logfile.log ./newLogFiles2/
+
+python ../learning_curve.py my_logfile.log
+
+
+Change buffer size, (-n) learning rate, gamma (-g).
+Change rewards weight
+Change/Delete the getQFunctionInput because of redundancy
+Explore is stochastic
+ReLu is better than tanh
+
+
+java -cp "./lib/*:." edu.bu.tetris.Main -q src.pas.tetris.agents.TetrisQAgent -i ./params/qFunction2278.model
+
+
+
+16
+
+tetris_test2: Exploration deterministic and 7 features, 0.5 holes (not yet)
+My machine: Exploration deterministic and 7 features, 0.2 holes
+tetris_test: Exploration deterministic and 10 features
